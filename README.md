@@ -30,25 +30,10 @@
 | 以前说到过的 | 关键词字面匹配（3~4 字 n-gram + 多词命中排序） | 不要 |
 | 以前相关的 | bge-m3 向量语义召回（预向量化缓存） | 要（但已提前算好） |
 
-## 为什么这么注入 —— 三次踩坑换来的
+## 注入机制
 
-DSH 里能注入记忆的地方不止一个，前三条路都试过，都不行：
-
-### ❌ `agent.inject(user/message)`
-
-往 inbox 塞消息。源码里 `inject` 是 `send(input, "next-step", false)` —— 塞进 next-step **且不唤醒**。turn 不消费就积压，群消息一密就把队列压垮。实测把主会话卡死过一次。
-
-### ❌ `systemPrompt.context()` 的同步 `text()`
-
-主机装配提示词时 `text(context)` 是**同步调用**的（源码里直接执行，不 `await`），塞不进 300ms 的网络向量化。而 fish-memory 那类插件能在里面做召回，是因为它们**全本地关键词匹配**，一次网络都不发。
-
-### ❌ 从 `session.log` 找「最后一条消息」
-
-`systemPrompt` 的 `text()` 在**请求装配时**求值，而这一轮的 user 消息要等装配完才落进 `session.log` —— 拿到的永远是**上一轮**。
-
-### ✅ `agent/pre-step`（waterfall）
-
-DSH 用 `await dispatch.waterfall("agent/pre-step", { messages, turn, step }, …)` 调用它，参数里带着这一轮 claim 到的消息，而且允许返回修改后的 `messages`。
+走 DSH 的 `agent/pre-step`：turn 开始前的 waterfall 事件，DSH 会 `await` 它，
+参数里带着这一轮 claim 到的消息，允许返回修改后的 `messages`。
 
 ```
 agent/pre-step（await，模型还没被调用）
@@ -58,7 +43,8 @@ agent/pre-step（await，模型还没被调用）
   → 返回给 DSH → 模型调用
 ```
 
-不碰 inbox、不塞会话事件、不同步求值——既不卡队列、不慢一拍、也不串号。
+不碰 inbox、不塞会话事件、不在同步的提示词装配里求值，所以不占消息队列，
+也不会拿错轮次的消息。
 
 ## 预向量化
 
