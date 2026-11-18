@@ -213,6 +213,7 @@ function makeAgent() {
 
 function makeRuntime() {
   return {
+    log: () => {},
     configStore: { get: () => ({ inject: { enabled: true, maxChars: 2000 }, recall: { recent: 10, semantic: 8, minScore: 0 } }) },
     embedOne: async () => ({ vector: new Float32Array([1, 0]), dims: 2 }),
     recall: (senderId) => ({
