@@ -1,0 +1,9 @@
+- insert:
+    - id: dsh-group-vector-memory
+      name: dsh-group-vector-memory
+      config:
+        dataDir: !!js dshHomePath('plugins/dsh-group-vector-memory')
+
+# RPC 需要 Web Server 来注册 Host routes。
+- id: connection
+  inject: [webStartup, webServer]
