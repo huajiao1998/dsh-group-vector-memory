@@ -1,107 +1,50 @@
-console.log("START")
 import assert from 'node:assert/strict'
+import { test } from 'node:test'
 import { installInjector } from '../lib/inject.js'
+import { defaultImPath } from '../lib/dshim.js'
 
-// ---- 假的运行时 ----
-function makeRuntime({ messages = [], vectors = [] } = {}) {
-  return {
-    configStore: {
-      get: () => ({ enabled: true, inject: { enabled: true, maxChars: 2000 }, recall: { recent: 10, semantic: 5, minScore: 0.0 } }),
-    },
-    store: {
-      stats: () => ({ messages: messages.length }),
-      recentBySender: (sid, n) => messages.filter(m => m.sender === sid).slice(-n),
-      vectorsBySender: (sid) => vectors.filter(v => v.sender === sid),
-    },
-    embedder: { embedOne: async () => ({ vector: new Float32Array([1, 0, 0]), dims: 3, ms: 1 }) },
-  }
-}
-
-function makeCtx(agent) {
-  const handlers = []
-  return {
+test('运行中的工作区与总开关改动会更新已挂载会话，卸载时移除工具', async () => {
+  const handlers = new Map()
+  const tools = new Map()
+  const agent = {
+    session: { id: 'test', cwd: '/allowed' },
     ctx: {
-      on: (name, fn) => handlers.push({ name, fn }),
-      logger: { warn: (...a) => console.log('  [warn]', ...a) },
-      agents: { get: () => agent },
+      on(name, fn) { handlers.set(name, fn); return () => handlers.delete(name) },
+      tools: { register(def) { tools.set(def.name, def); return () => tools.delete(def.name) } },
     },
-    fire: (session, event) => handlers.forEach(h => h.name === 'session/event' && h.fn(session, event)),
   }
-}
-
-const mkEvent = (meta, text = '第24支你打算做什么？') => ({
-  type: 'user/message',
-  data: { content: [{ type: 'text', text: `<dsh_im_source>${JSON.stringify(meta)}</dsh_im_source>\n${text}` }] },
+  let cfg = { enabled: true, workspaces: ['/allowed'], inject: { enabled: true }, recall: { semantic: 0 } }
+  const runtime = {
+    configStore: { get: () => cfg },
+    ctx: { tools: { get: name => ({ name, execute: async () => ({ groupName: '合成群', items: [] }) }) } },
+    imReader: { path: defaultImPath(), groups: () => [{ id: 'local', name: '合成群', channel: 'qq', platform_group_id: 'g1' }] },
+    store: {},
+    recall: () => ({ recent: [{ text: '合成发言' }], semantic: [], literal: [] }),
+    format: ({ recent }) => recent[0].text,
+  }
+  const off = installInjector({ agents: { list: () => [agent] } }, runtime)
+  const messages = [{
+    role: 'user', source: { kind: 'user', rpcId: 'qq-00000000-0000-4000-8000-000000000001' },
+    content: [{ type: 'text', text: '<dsh_im_source>{"channel":"qq","chatId":"g1","senderId":"u1"}</dsh_im_source>\n合成查询' }],
+  }]
+  const step = (turn) => handlers.get('agent/pre-step')({ turn, messages }, async () => ({ kind: 'enter', messages }))
+  try {
+    assert.equal((await step(1)).messages.length, 2)
+    assert.ok(tools.has('group_memory_lookup'))
+    cfg = { ...cfg, workspaces: ['/other'] }
+    runtime.refreshAgentScopes()
+    assert.ok(!tools.has('group_memory_lookup'))
+    assert.equal((await step(2)).messages.length, 1)
+    cfg = { ...cfg, workspaces: [] }
+    runtime.refreshAgentScopes()
+    assert.equal((await step(3)).messages.length, 2)
+    cfg = { ...cfg, enabled: false }
+    runtime.refreshAgentScopes()
+    assert.ok(!tools.has('group_memory_lookup'))
+    assert.equal((await step(4)).messages.length, 1)
+  } finally {
+    off()
+  }
+  assert.equal(handlers.size, 0)
+  assert.equal(tools.size, 0)
 })
-
-let pass = 0, fail = 0
-async function t(name, fn) {
-  try { await fn(); pass++; console.log('  ✓', name) }
-  catch (e) { fail++; console.log('  ✗', name, '→', e.message) }
-}
-
-// 同步注入：inject 是同步调用，listener 里也是同步，所以等待一个 tick 即可
-const tick = () => new Promise(r => setTimeout(r, 0))
-
-(async () => {
-  console.log('注入流程:')
-
-  await t('群消息 → 调 agent.inject，内容含发言最近记录', async () => {
-    const agent = { injected: [], inject(m) { this.injected.push(m) } }
-    const runtime = makeRuntime({
-      messages: [
-        { sender: 'u1', text: '上周说过想学吉他', sentAt: 1 },
-        { sender: 'u1', text: '第24支你打算做什么？', sentAt: 2 },
-      ],
-    })
-    const { ctx, fire } = makeCtx(agent)
-    installInjector(ctx, runtime)
-    fire({ id: 's1' }, mkEvent({ channel: 'qq', senderId: 'u1', senderName: '王阿牛', chatId: 'g1' }))
-    await tick()
-    assert.equal(agent.injected.length, 1, '应该注入一次')
-    const text = agent.injected[0].content[0].text
-    assert.match(text, /王阿牛/)
-    assert.match(text, /第24支你打算做什么/)
-  })
-
-  await t('私聊（无 chatId、无 conversationType）→ 不注入', async () => {
-    const agent = { injected: [], inject(m) { this.injected.push(m) } }
-    const runtime = makeRuntime({ messages: [{ sender: 'u1', text: 'hi', sentAt: 1 }] })
-    const { ctx, fire } = makeCtx(agent)
-    installInjector(ctx, runtime)
-    fire({ id: 's1' }, mkEvent({ channel: 'qq', senderId: 'u1' }))
-    await tick()
-    assert.equal(agent.injected.length, 0)
-  })
-
-  await t('同一人短时间重复发 → 只注入一次（TTL 内去重）', async () => {
-    const agent = { injected: [], inject(m) { this.injected.push(m) } }
-    const runtime = makeRuntime({ messages: [{ sender: 'u1', text: '同一句', sentAt: 1 }] })
-    const { ctx, fire } = makeCtx(agent)
-    installInjector(ctx, runtime)
-    const ev = mkEvent({ channel: 'qq', senderId: 'u1', senderName: '王阿牛', chatId: 'g1' })
-    fire({ id: 's1' }, ev)
-    fire({ id: 's1' }, ev)
-    await tick()
-    assert.equal(agent.injected.length, 1, 'TTL 内应只注入一次')
-  })
-
-  await t('普通消息（无 source）→ 不注入', async () => {
-    const agent = { injected: [], inject(m) { this.injected.push(m) } }
-    const { ctx, fire } = makeCtx(agent)
-    installInjector(ctx, makeRuntime())
-    fire({ id: 's1' }, { type: 'user/message', data: { content: [{ type: 'text', text: '普通消息' }] } })
-    await tick()
-    assert.equal(agent.injected.length, 0)
-  })
-
-  await t('拿不到 agent → 不抛错', async () => {
-    const { ctx, fire } = makeCtx(undefined)
-    installInjector(ctx, makeRuntime({ messages: [{ sender: 'u1', text: 'x', sentAt: 1 }] }))
-    fire({ id: 's1' }, mkEvent({ channel: 'qq', senderId: 'u1', chatId: 'g1' }))
-    await tick()
-  })
-
-  console.log(`\n${pass} 通过, ${fail} 失败`)
-  process.exit(fail ? 1 : 0)
-})()

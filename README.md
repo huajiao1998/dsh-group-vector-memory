@@ -1,86 +1,6 @@
 # dsh-group-vector-memory
 
-给 DSH（DeepSeek Harness）的 QQ/飞书群聊加一份**按发送者隔离**的记忆：群里每个人说话时，自动召回**他自己**最近说过的话和相关历史，注入到这一轮的上下文里。
-
-不是全局记忆，是一个群友一份——不会把甲说的话记到乙头上。
-
-## 它做什么
-
-群消息进来时，在模型被调用之前，往这一轮的消息里追加一段记忆块：
-
-```
-【群里这个人：王阿牛（ID 7588BBE5…）】
-最近说过的：
-- 第24支你打算做什么？
-- 好吧
-- 哎呀，这些事情不用群里说啊，怎么啥事都往群里说
-- …
-以前说到过的：
-- 从群里发的信息不应该会发群信息吗…
-以前相关的：
-- 在干嘛啊
-- 第24支你打算做什么？
-```
-
-三段分别来自：
-
-| 段落 | 来源 | 要不要网络 |
-|---|---|---|
-| 最近说过的 | SQLite 按 sender 取最近 N 条 | 不要 |
-| 以前说到过的 | 关键词字面匹配（3~4 字 n-gram + 多词命中排序） | 不要 |
-| 以前相关的 | bge-m3 向量语义召回（预向量化缓存） | 要（但已提前算好） |
-
-## 注入机制
-
-走 DSH 的 `agent/pre-step`：turn 开始前的 waterfall 事件，DSH 会 `await` 它，
-参数里带着这一轮 claim 到的消息，允许返回修改后的 `messages`。
-
-```
-agent/pre-step（await，模型还没被调用）
-  → 拿到这一轮的 messages
-  → await 向量化 + 召回
-  → 把记忆块追加进 messages
-  → 返回给 DSH → 模型调用
-```
-
-不碰 inbox、不塞会话事件、不在同步的提示词装配里求值，所以不占消息队列，
-也不会拿错轮次的消息。
-
-## 模型主动查询
-
-自动注入只管「这一轮正在说话的人」。想要翻别人的、翻更早的，用注册的工具：
-
-```
-group_memory_lookup({ person: "王阿牛", query: "服务器", limit: 5 })
-```
-
-- **按人查**，不是把群里所有人最近的消息糊成一坨
-- `person` 支持名字或 ID，名字只写一部分也能找到（「阿牛」能匹配「王阿牛」）
-- 不给 `query`：返回这个人最近 N 条
-- 给 `query`：关键词字面召回 + bge-m3 语义召回，按相关度合并去重
-- `groupId` 可选，不填就跨群查这个人
-
-输出带时间、群标签，模型能直接看出是哪天在哪个群说的。
-
-高召回时漏掉的旧话，模型可以主动翻出来，不用等人问。
-
-## 预向量化
-
-向量期望在 `pre-step` 里就绪，所以有个后台扫描：
-
-```
-每 200ms 扫一遍 dsh-im 的 group-history.sqlite
-  → 发现新消息 → 立即算向量 → 存内存缓存
-  → pre-step 时直接命中（实测 0ms）
-```
-
-命中不了就现算（约 300ms），`pre-step` 是 `await` 的，等得起。
-
-**语义查询只用这一条消息的向量**：算不出来就只给最近 N 条和字面召回，绝不拿上一条旧消息的向量冒充——那是错的召回。
-
-## 按群隔离
-
-数据按 `group_id` + `sender_id` 双重隔离。设置页的记忆管理是两级的：先选群，再选人。发言列表可翻页查看旧记录；可以逐条编辑、删除，也可以清除某个群友在该群的全部记忆。操作只影响插件记忆，不改动群聊原始记录。单条操作都强制校验 `groupId` + `senderId` + `messageId`，删除还要求 `confirm: true`，防止跨群误改误删。编辑会让旧向量失效，删除和编辑都会记录本地覆盖标记，避免下一轮只读 IM 同步把手工操作覆盖掉。
+DSH 群聊记忆插件。群消息进入会话时，按当前群和发言人召回近期发言及相关历史。也可以在网页设置里浏览、编辑和删除插件收录的记忆。
 
 ## 安装
 
@@ -88,54 +8,59 @@ group_memory_lookup({ person: "王阿牛", query: "服务器", limit: 5 })
 dsh plugin --profile web add dsh-group-vector-memory
 ```
 
-装完重启 DSH。插件声明了 `dsh.bundle.patch`，`dsh.profile.bundles` 会自动追加。
+装完重启 DSH。插件声明了 `dsh.bundle.patch`，安装时自动追加到 `dsh.profile.bundles`。
 
-## 配置
+## 会话召回
 
-设置页 → 群聊记忆。也可以直接改 `~/.dsh/plugins/dsh-group-vector-memory/config.json`：
+自动注入和 `group_memory_lookup` 只查 DSH 宿主授权的当前群。模型不能传 `groupId` 切换群；私聊、网页消息、混合来源或无法唯一确认群的请求不会触发召回。群身份校验依赖 dsh-im 的当前轮归档工具及其默认归档位置；使用独立归档路径或关掉消息来源增强时，可能只保留管理页功能。
+
+```js
+group_memory_lookup({ person: '示例群友', query: '服务器', limit: 5 })
+```
+
+`person` 支持名称或 ID；不填 `query` 返回近期发言。语义查询等待最多 500 毫秒，向量不可用时仍可用本地关键词和近期记录。此隔离约束新的召回，不改变 DSH 已写入的会话历史。需要彻底隔离历史上下文时，请给不同群使用独立 DSH 会话。
+
+## 设置与管理
+
+在「设置 → 群聊记忆」中：
+
+- 总开关控制收录、外部向量化及会话记忆；关闭不删除现有数据。
+- 工作区范围只限制会话注入与查询，不改变群历史收录范围。通过页面保存后，已有会话也会应用新范围。
+- 关闭外部向量化后，仍可收录并使用本地关键词和近期发言；「测试连接」仅发送固定测试文本，并且每次实际请求保存的接口。
+- 在群聊记录中展开群友，可以翻页、编辑、删除或预览本群的召回。预览不填查询时只读近期发言，不把某条历史消息默认发给向量服务。
+- 清除某个群友时，以确认操作时的消息源截止点为界，只清除其在该群的既有记忆，包括尚未同步的旧消息；之后新收到的消息仍能收录。消息源不可用、无法确定范围时，整人清除会报错，不做部分删除。
+
+配置示例：
 
 ```json
 {
   "enabled": true,
+  "workspaces": [],
   "embedding": {
-    "baseUrl": "https://api.siliconflow.cn/v1/embeddings",
+    "enabled": true,
+    "baseUrl": "https://api.siliconflow.cn/v1",
     "model": "BAAI/bge-m3",
     "dimensions": 1024,
     "apiKey": "sk-…"
   },
-  "recall": {
-    "recent": 6,
-    "semantic": 8,
-    "minScore": 0.25
-  },
-  "inject": {
-    "enabled": true,
-    "maxChars": 2000
-  }
+  "recall": { "recent": 6, "semantic": 8, "minScore": 0.25 },
+  "inject": { "enabled": true, "maxChars": 2000 }
 }
 ```
 
-`apiKey` 只在服务端用，RPC 返回给前端时会被剥掉，只给 `apiKeySet` / `apiKeyMasked`。
+密钥只保存在服务端。更换接口域名或端口时，需要输入新密钥或明确清除旧密钥。接口、模型或维度变化后，旧向量不会与新向量混用；旧记录按批次重算。
 
-## 数据
+## 数据与升级
 
-`~/.dsh/plugins/dsh-group-vector-memory/memory.sqlite`：
-
-```
-messages(id, group_id, sender_id, sender_name, text, sent_at, embedding BLOB)
-message_overrides(id, action, text, updated_at) -- 本地编辑/删除覆盖
-meta(key, value)      -- last_sent_at 等
-profiles(...)         -- 预留
-```
-
-向量以 Float32Array 存 BLOB，1024 维 = 4KB/条。设置页能看到每个群、每个人的占用，删人之后自动 `VACUUM` 把空间还给磁盘。
+IM 归档只读；编辑和删除只影响插件自己的 SQLite 副本。单条编辑会使向量失效，单条删除会留下同步标记，避免旧消息重新导入。升级后会回放现存源归档并沿用旧编辑与删除标记，按接收时间和源行号续读，因此旧发送时间的迟到消息仍可进入记忆。来源没有持久的单调序号，源时钟倒退或数据库被外部替换不在顺序保证内。已被来源淘汰的历史不能从源找回。
 
 ## 开发
 
 ```bash
-node --test test/all.test.mjs     # 当前测试集
-node test/real-data.mjs           # 拿真实 IM 历史跑一遍召回
+node --test test/*.test.mjs
 ```
+
+回归测试使用合成归档和向量服务替身。
 
 ## 许可证
 

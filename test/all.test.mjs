@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createConfigStore, DEFAULT_CONFIG } from '../lib/config.js'
 import { createStore, cosine } from '../lib/store.js'
-import { createImReader } from '../lib/dshim.js'
+import { createImReader, defaultImPath } from '../lib/dshim.js'
 import { recallSync, recallAsync, formatMemoryBlock, extractKeywords } from '../lib/recall.js'
 import { parseImSource, mountAgent, cleanQuery, findGroupMessage, workspaceAllowed } from '../lib/inject.js'
 import { createRpc } from '../lib/rpc.js'
@@ -126,7 +126,7 @@ test('sync: watcher 不跳过待入库消息，同一时间戳可跨批次续读
   runtime.embedder.embedOne = async () => ({ vector: new Float32Array([1]), dims: 1 })
   await runtime.watchNew()
   assert.equal(runtime.store.stats().messages, 0)
-  assert.equal(runtime.store.getMeta('last_message_cursor'), null)
+  assert.equal(runtime.store.getSyncCursor(), 0)
   assert.equal((await runtime.syncOnce()).added, 500)
   assert.equal((await runtime.syncOnce()).added, 2)
   assert.equal((await runtime.syncOnce()).added, 0)
@@ -232,6 +232,7 @@ test('formatMemoryBlock: 无名字时用 ID', () => {
 // ---------------- inject（agent/pre-step waterfall） ----------------
 const mkMsg = (meta, body = '说话内容') => ({
   role: 'user',
+  source: { kind: 'user', rpcId: 'qq-00000000-0000-4000-8000-000000000001' },
   content: [{ type: 'text', text: `<dsh_im_source>${JSON.stringify(meta)}</dsh_im_source>\n${body}` }],
 })
 
@@ -274,7 +275,9 @@ function makeAgent() {
 function makeRuntime() {
   return {
     log: () => {},
-    configStore: { get: () => ({ inject: { enabled: true, maxChars: 2000 }, recall: { recent: 10, semantic: 8, minScore: 0 } }) },
+    configStore: { get: () => ({ enabled: true, inject: { enabled: true, maxChars: 2000 }, recall: { recent: 10, semantic: 8, minScore: 0 } }) },
+    ctx: { tools: { get: () => ({ name: 'dsh_im_group_history', execute: async () => ({ groupName: 'fixture-a', items: [] }) }) } },
+    imReader: { path: defaultImPath(), groups: () => [{ id: 'group-a', channel: 'qq', platform_group_id: 'g1', name: 'fixture-a' }] },
     embedOne: async () => ({ vector: new Float32Array([1, 0]), dims: 2 }),
     recall: (senderId) => ({
       recent: [{ text: '最近一条' }],
@@ -491,11 +494,14 @@ test('embed: 维度不一致时报清晰错误', async () => {
   clean(d)
 })
 
-test('rpc: preview 不给 query 时自动用最后一条消息', async () => {
+test('rpc: 预览只查指定群，不把默认原文发给向量服务', async () => {
   const d = tmp()
   const configStore = createConfigStore(d)
   const store = createStore(d)
-  store.upsertMessages([{ id: 'g:1', groupId: 'g', senderId: 'u1', senderName: 'A', text: '最后一句', sentAt: 1 }])
+  store.upsertMessages([
+    { id: 'g:1', groupId: 'g', senderId: 'u1', senderName: 'A', text: '本群最后一句', sentAt: 1 },
+    { id: 'x:1', groupId: 'x', senderId: 'u1', senderName: 'A', text: '其他群内容', sentAt: 2 },
+  ])
   const runtime = {
     configStore, store, dataDir: d,
     embedder: { embedOne: async () => null },
@@ -503,9 +509,10 @@ test('rpc: preview 不给 query 时自动用最后一条消息', async () => {
     syncOnce: async () => ({}),
   }
   const rpc = createRpc(runtime)
-  const r = await rpc('preview', { senderId: 'u1' })
-  assert.equal(r.ok, true)
-  assert.match(r.value.block, /最后一句/)
+  const r = await rpc('preview', { senderId: 'u1', groupId: 'g' })
+  assert.equal(r.ok, true, r.error?.message)
+  assert.match(r.value.block, /本群最后一句/)
+  assert.doesNotMatch(r.value.block, /其他群内容/)
   store.close(); clean(d)
 })
 
@@ -608,10 +615,13 @@ test('rpc: members/delete 必须同时有 groupId 和 confirm', async () => {
   const d = tmp()
   const store = createStore(d)
   store.upsertMessages([{ id: 'g:1', groupId: 'g', senderId: 'u1', text: 'a', sentAt: 1 }])
-  const runtime = { store, configStore: createConfigStore(d), dataDir: d, embedder: {}, imReader: createImReader('/nope'), syncOnce: async () => ({}) }
+  const runtime = { store, configStore: createConfigStore(d), dataDir: d, embedder: {}, imReader: { available: () => false, latestArrival: floor => floor }, syncOnce: async () => ({}) }
   const rpc = createRpc(runtime)
   assert.equal((await rpc('members/delete', { senderId: 'u1', confirm: true })).ok, false, '没 groupId 应拒绝')
   assert.equal((await rpc('members/delete', { senderId: 'u1', groupId: 'g' })).ok, false, '没 confirm 应拒绝')
+  assert.equal((await rpc('members/delete', { senderId: 'u1', groupId: 'g', confirm: true })).ok, false, '无法确定源端截止时不做部分清除')
+  assert.equal(store.stats().messages, 1)
+  runtime.imReader.available = () => true
   const yes = await rpc('members/delete', { senderId: 'u1', groupId: 'g', confirm: true })
   assert.equal(yes.ok, true)
   assert.equal(yes.value.deleted, 1)
@@ -688,7 +698,7 @@ function makeToolRuntime(overrides = {}) {
 
 test('tool: 注册了 group_memory_lookup', () => {
   const { ctx, captured } = makeToolCtx()
-  registerMemoryTool(ctx, makeToolRuntime())
+  registerMemoryTool(ctx, makeToolRuntime(), { trusted: true })
   assert.equal(captured.def.name, 'group_memory_lookup')
   assert.ok(captured.def.parameters.properties.person, '必须有 person 参数')
   assert.deepEqual(captured.def.parameters.required, ['person'])
@@ -696,7 +706,7 @@ test('tool: 注册了 group_memory_lookup', () => {
 
 test('tool: 按名字查到人，返回最近记录', async () => {
   const { ctx, captured } = makeToolCtx()
-  registerMemoryTool(ctx, makeToolRuntime())
+  registerMemoryTool(ctx, makeToolRuntime(), { trusted: true })
   const out = await captured.def.execute({ person: '王阿牛' })
   assert.equal(out.found, 1)
   assert.match(out.text, /王阿牛/)
@@ -705,14 +715,14 @@ test('tool: 按名字查到人，返回最近记录', async () => {
 
 test('tool: 名字只写一部分也能找到', async () => {
   const { ctx, captured } = makeToolCtx()
-  registerMemoryTool(ctx, makeToolRuntime())
+  registerMemoryTool(ctx, makeToolRuntime(), { trusted: true })
   const out = await captured.def.execute({ person: '阿牛' })
   assert.equal(out.found, 1)
 })
 
 test('tool: 查不到人时列出现有成员', async () => {
   const { ctx, captured } = makeToolCtx()
-  registerMemoryTool(ctx, makeToolRuntime())
+  registerMemoryTool(ctx, makeToolRuntime(), { trusted: true })
   const out = await captured.def.execute({ person: '不存在的人' })
   assert.equal(out.found, 0)
   assert.match(out.text, /王阿牛/)
@@ -720,7 +730,7 @@ test('tool: 查不到人时列出现有成员', async () => {
 
 test('tool: 给 query 时走关键词召回', async () => {
   const { ctx, captured } = makeToolCtx()
-  registerMemoryTool(ctx, makeToolRuntime())
+  registerMemoryTool(ctx, makeToolRuntime(), { trusted: true })
   const out = await captured.def.execute({ person: '王阿牛', query: '关键词' })
   assert.equal(out.found, 1)
   assert.match(out.text, /关键词命中的一条/)
@@ -730,10 +740,10 @@ test('tool: 插件关着时直说关了', async () => {
   const { ctx, captured } = makeToolCtx()
   const rt = makeToolRuntime()
   rt.configStore.get = () => ({ enabled: false })
-  registerMemoryTool(ctx, rt)
+  registerMemoryTool(ctx, rt, { trusted: true })
   const out = await captured.def.execute({ person: '王阿牛' })
   assert.equal(out.found, 0)
-  assert.match(out.text, /关着/)
+  assert.match(out.text, /未启用/)
 })
 
 test('tool: limit 上限 30 且默认 8', async () => {
@@ -749,7 +759,7 @@ test('tool: limit 上限 30 且默认 8', async () => {
       vectorsBySender: () => [],
     },
   })
-  registerMemoryTool(ctx, rt)
+  registerMemoryTool(ctx, rt, { trusted: true })
   await captured.def.execute({ person: '王阿牛' })
   assert.equal(calls[0], 8, '默认 8 条')
 })
@@ -773,7 +783,7 @@ test('workspace: 别的工作区不命中', () => {
   assert.equal(workspaceAllowed('', ['/root/工作目录/AIlife']), false, '没有 cwd 时保守拒绝')
 })
 
-test('workspace: 不匹配的会话不挂 pre-step、不注册工具', () => {
+test('workspace: 不匹配的会话只保留门控钩子，不注册工具', () => {
   const handlers = []
   const tools = []
   const agent = {
@@ -784,9 +794,9 @@ test('workspace: 不匹配的会话不挂 pre-step、不注册工具', () => {
     },
   }
   const runtime = makeRuntime()
-  runtime.configStore.get = () => ({ inject: { enabled: true }, workspaces: ['/root/工作目录/AIlife'] })
+  runtime.configStore.get = () => ({ enabled: true, inject: { enabled: true }, workspaces: ['/root/工作目录/AIlife'] })
   mountAgent(agent, runtime)
-  assert.equal(handlers.length, 0, '没挂 pre-step')
+  assert.equal(handlers.length, 1, '保留钩子以响应运行中的配置变更')
   assert.equal(tools.length, 0, '没注册工具')
 })
 
@@ -801,7 +811,7 @@ test('workspace: 匹配的会话挂 pre-step 并注册工具（agent scope）', 
     },
   }
   const runtime = makeRuntime()
-  runtime.configStore.get = () => ({ inject: { enabled: true }, workspaces: ['/root/工作目录/AIlife'] })
+  runtime.configStore.get = () => ({ enabled: true, inject: { enabled: true }, workspaces: ['/root/工作目录/AIlife'] })
   mountAgent(agent, runtime)
   assert.ok(handlers.some(h => h.n === 'agent/pre-step'), '要挂 pre-step')
   assert.equal(tools.length, 1, '要注册一个工具')
@@ -810,7 +820,7 @@ test('workspace: 匹配的会话挂 pre-step 并注册工具（agent scope）', 
 
 test('tool: render 必须返回内容块数组（dsh 会调 content.some）', () => {
   const { ctx, captured } = makeToolCtx()
-  registerMemoryTool(ctx, makeToolRuntime())
+  registerMemoryTool(ctx, makeToolRuntime(), { trusted: true })
   const out = captured.def.output.render({}, { found: 1, text: 'hi' })
   assert.ok(Array.isArray(out), 'render 必须返回数组，裸字符串会让 dsh 的 content.some 报错')
   assert.equal(out[0].type, 'text')
@@ -819,7 +829,7 @@ test('tool: render 必须返回内容块数组（dsh 会调 content.some）', ()
 
 test('tool: render 空值也返回数组', () => {
   const { ctx, captured } = makeToolCtx()
-  registerMemoryTool(ctx, makeToolRuntime())
+  registerMemoryTool(ctx, makeToolRuntime(), { trusted: true })
   const out = captured.def.output.render({}, undefined)
   assert.ok(Array.isArray(out))
   assert.equal(out[0].type, 'text')
