@@ -133,6 +133,26 @@ test('pre-step and tool use the same authorized group; another channel may share
   assert.equal(f.hostRequests(), 4)
 })
 
+test('QQ bare mention follow-up runs one authorized query with nearby matching context', async t => {
+  const f = fixture(t)
+  const queries = []
+  f.runtime.embedOne = async query => { queries.push(query); return { vector } }
+  const previous = text => `<dsh_im_context>${JSON.stringify({ collector: 'qq-mention-followup', content: text })}</dsh_im_context>`
+  const withBody = body => {
+    const message = groupMessage()
+    message.content[0].text = message.content[0].text.replace(/keyword$/, body)
+    return message
+  }
+  const main = '一天睡多久阿'
+  assert.ok(memory(await f.step([withBody(`${previous('小鱼也喜欢睡觉吗')}\n\n${main}`)])))
+  assert.ok(memory(await f.step([withBody(`${previous('今天记得带伞')}\n\n${main}`)], 2)))
+  assert.ok(memory(await f.step([withBody('一条新的正文')], 3)))
+  assert.deepEqual(queries, [`${main}\n小鱼也喜欢睡觉吗`, main, '一条新的正文'])
+  f.setHostLabel('')
+  assert.equal(memory(await f.step([withBody(`${previous('小鱼也喜欢睡觉吗')}\n\n${main}`)], 4)), null)
+  assert.equal(queries.length, 3)
+})
+
 test('missing, forged, ambiguous, private or mixed group origins do not perform recall', async t => {
   const f = fixture(t)
   const good = groupMessage()
