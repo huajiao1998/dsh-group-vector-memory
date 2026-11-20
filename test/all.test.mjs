@@ -7,7 +7,7 @@ import { createConfigStore, DEFAULT_CONFIG } from '../lib/config.js'
 import { createStore, cosine } from '../lib/store.js'
 import { createImReader } from '../lib/dshim.js'
 import { recallSync, recallAsync, formatMemoryBlock, extractKeywords } from '../lib/recall.js'
-import { parseImSource, mountAgent, cleanQuery, findGroupMessage } from '../lib/inject.js'
+import { parseImSource, mountAgent, cleanQuery, findGroupMessage, workspaceAllowed } from '../lib/inject.js'
 import { createRpc } from '../lib/rpc.js'
 import { registerMemoryTool } from '../lib/tool.js'
 import { createEmbedder } from '../lib/embed.js'
@@ -644,5 +644,59 @@ test('tool: limit 上限 30 且默认 8', async () => {
   registerMemoryTool(ctx, rt)
   await captured.def.execute({ person: '王阿牛' })
   assert.equal(calls[0], 8, '默认 8 条')
+})
+
+// ---------------- 按工作区启用 ----------------
+test('workspace: 空配置全启用', () => {
+  assert.equal(workspaceAllowed('/root/工作目录/AIlife', []), true)
+  assert.equal(workspaceAllowed('/root/工作目录/AIlife', undefined), true)
+  assert.equal(workspaceAllowed('/', []), true)
+})
+
+test('workspace: 精确匹配和子目录都算命中', () => {
+  assert.equal(workspaceAllowed('/root/工作目录/AIlife', ['/root/工作目录/AIlife']), true)
+  assert.equal(workspaceAllowed('/root/工作目录/AIlife/docs', ['/root/工作目录/AIlife']), true)
+  assert.equal(workspaceAllowed('/root/工作目录/AIlife', ['/root/工作目录/AIlife/']), true)
+})
+
+test('workspace: 别的工作区不命中', () => {
+  assert.equal(workspaceAllowed('/root/工作目录/pyssh', ['/root/工作目录/AIlife']), false)
+  assert.equal(workspaceAllowed('/root/工作目录/AIlife2', ['/root/工作目录/AIlife']), false, '前缀要按目录边界，不能 AIlife2 也算')
+  assert.equal(workspaceAllowed('', ['/root/工作目录/AIlife']), false, '没有 cwd 时保守拒绝')
+})
+
+test('workspace: 不匹配的会话不挂 pre-step、不注册工具', () => {
+  const handlers = []
+  const tools = []
+  const agent = {
+    session: { id: 's1', header: { cwd: '/root/工作目录/pyssh' } },
+    ctx: {
+      on: (n, f) => { handlers.push({ n, f }); return () => {} },
+      tools: { register: (d) => { tools.push(d); return () => {} } },
+    },
+  }
+  const runtime = makeRuntime()
+  runtime.configStore.get = () => ({ inject: { enabled: true }, workspaces: ['/root/工作目录/AIlife'] })
+  mountAgent(agent, runtime)
+  assert.equal(handlers.length, 0, '没挂 pre-step')
+  assert.equal(tools.length, 0, '没注册工具')
+})
+
+test('workspace: 匹配的会话挂 pre-step 并注册工具（agent scope）', () => {
+  const handlers = []
+  const tools = []
+  const agent = {
+    session: { id: 's1', header: { cwd: '/root/工作目录/AIlife' } },
+    ctx: {
+      on: (n, f) => { handlers.push({ n, f }); return () => {} },
+      tools: { register: (d) => { tools.push(d); return () => {} } },
+    },
+  }
+  const runtime = makeRuntime()
+  runtime.configStore.get = () => ({ inject: { enabled: true }, workspaces: ['/root/工作目录/AIlife'] })
+  mountAgent(agent, runtime)
+  assert.ok(handlers.some(h => h.n === 'agent/pre-step'), '要挂 pre-step')
+  assert.equal(tools.length, 1, '要注册一个工具')
+  assert.equal(tools[0].name, 'group_memory_lookup')
 })
 
