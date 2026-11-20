@@ -11,6 +11,8 @@ import { parseImSource, mountAgent, cleanQuery, findGroupMessage, workspaceAllow
 import { createRpc } from '../lib/rpc.js'
 import { registerMemoryTool } from '../lib/tool.js'
 import { createEmbedder } from '../lib/embed.js'
+import { DatabaseSync } from 'node:sqlite'
+import { apply } from '../lib/index.js'
 
 const tmp = () => mkdtempSync(join(tmpdir(), 'gvm-'))
 const clean = (d) => { try { rmSync(d, { recursive: true, force: true }) } catch {} }
@@ -98,6 +100,63 @@ test('store: pendingEmbeddings 只返回没向量的', () => {
   assert.equal(pending.length, 1)
   assert.equal(pending[0].id, 'g:2')
   s.close(); clean(d)
+})
+
+// ---------------- sync ----------------
+function makeSyncRuntime(t, rows = []) {
+  const d = tmp()
+  const imPath = join(d, 'im.sqlite')
+  const db = new DatabaseSync(imPath)
+  db.exec(`CREATE TABLE messages (
+    id TEXT PRIMARY KEY, group_id TEXT NOT NULL, platform_message_id TEXT NOT NULL,
+    sender_id TEXT NOT NULL, sender_name TEXT NOT NULL, text TEXT NOT NULL, sent_at INTEGER NOT NULL
+  )`)
+  const insert = db.prepare("INSERT INTO messages VALUES (?, 'g', ?, 'u1', '', ?, ?)")
+  for (const row of rows) insert.run(...row)
+  db.close()
+  let dispose
+  const runtime = apply({ connection: { rpc: { handle() {} } }, effect: init => { dispose = init() } }, { dataDir: d, imPath })
+  t.after(() => { dispose(); clean(d) })
+  return runtime
+}
+
+test('sync: watcher 不跳过待入库消息，同一时间戳可跨批次续读', async t => {
+  const rows = Array.from({ length: 502 }, (_, i) => [`m${String(i).padStart(3, '0')}`, '', '原始文本', 10])
+  const runtime = makeSyncRuntime(t, rows)
+  runtime.embedder.embedOne = async () => ({ vector: new Float32Array([1]), dims: 1 })
+  await runtime.watchNew()
+  assert.equal(runtime.store.stats().messages, 0)
+  assert.equal(runtime.store.getMeta('last_message_cursor'), null)
+  assert.equal((await runtime.syncOnce()).added, 500)
+  assert.equal((await runtime.syncOnce()).added, 2)
+  assert.equal((await runtime.syncOnce()).added, 0)
+  assert.equal(runtime.store.stats().messages, 502)
+  const last = runtime.imReader.since({ sentAt: 10, sourceId: 'm500' }, 1)[0]
+  assert.equal(last.id, runtime.imReader.since(0, 502).at(-1).id, '缺少平台 ID 时也要跨批次保持稳定 ID')
+  assert.equal(runtime.store.deleteMessage(last.id, 'g', 'u1'), true)
+  assert.equal(runtime.store.upsertMessages([last]), 0)
+  assert.equal(runtime.store.stats().messages, 501)
+})
+
+test('sync: 编辑后的记忆不接收旧向量，无新消息照常重算', async t => {
+  const runtime = makeSyncRuntime(t, [['row1', '1', '原始文本', 10]])
+  const oldVector = Promise.withResolvers()
+  runtime.embedder.embedOne = () => oldVector.promise
+  const inFlight = runtime.syncOnce()
+  const rpc = createRpc(runtime)
+  const edited = await rpc('members/message-update', { messageId: 'g:1', groupId: 'g', senderId: 'u1', text: '修改后的文本' })
+  assert.equal(edited.ok, true)
+  oldVector.resolve({ vector: new Float32Array([0]) })
+  assert.equal((await inFlight).embedded, 0)
+  assert.equal(runtime.store.stats().embedded, 0)
+  runtime.embedder.embedOne = async text => {
+    assert.equal(text, '修改后的文本')
+    return { vector: new Float32Array([1]) }
+  }
+  const result = await runtime.syncOnce()
+  assert.equal(result.added, 0)
+  assert.equal(result.embedded, 1, result.embedError)
+  assert.deepEqual([...runtime.store.vectorsBySender('u1')[0].vector], [1])
 })
 
 // ---------------- recall ----------------
@@ -492,6 +551,40 @@ test('members: 删除只删指定群里指定的人，不影响别的群', () =>
   assert.equal(s.stats().messages, 2)
   assert.equal(s.members('g2').length, 1, 'g2 里的 u1 还在')
   assert.equal(s.members('g2')[0].count, 1)
+  s.upsertMessages([
+    { id: 'g1:1', groupId: 'g1', senderId: 'u1', text: 'a', sentAt: 1 },
+    { id: 'g1:2', groupId: 'g1', senderId: 'u2', text: 'b', sentAt: 2 },
+  ])
+  assert.equal(s.stats().messages, 2, '整位群友清除后同步不可复活被删的消息')
+  s.close(); clean(d)
+})
+
+test('members: 单条编辑会让旧向量失效，并覆盖后续 IM 同步', () => {
+  const d = tmp()
+  const s = createStore(d)
+  const row = { id: 'g:1', groupId: 'g', senderId: 'u1', senderName: '甲', text: '原始记忆', sentAt: 1 }
+  s.upsertMessages([row])
+  s.setEmbedding(row.id, new Float32Array([1, 0]))
+  assert.equal(s.updateMessage(row.id, row.groupId, row.senderId, '手工改过的记忆'), true)
+  assert.deepEqual(s.messagesOf('u1', 'g')[0], { id: 'g:1', text: '手工改过的记忆', sentAt: 1, groupId: 'g' })
+  assert.equal(s.stats().embedded, 0, '编辑后旧向量必须失效')
+  s.upsertMessages([row])
+  assert.equal(s.messagesOf('u1', 'g')[0].text, '手工改过的记忆', '同步不能覆盖手工编辑')
+  assert.equal(s.updateMessage(row.id, 'other', row.senderId, '不应改成功'), false, '群不匹配时拒绝')
+  assert.equal(s.updateMessage(row.id, row.groupId, row.senderId, '   '), false, '空内容拒绝')
+  s.close(); clean(d)
+})
+
+test('members: 单条删除写 tombstone，后续 IM 同步不会复活', () => {
+  const d = tmp()
+  const s = createStore(d)
+  const row = { id: 'g:1', groupId: 'g', senderId: 'u1', text: '要删掉', sentAt: 1 }
+  s.upsertMessages([row])
+  assert.equal(s.deleteMessage(row.id, row.groupId, row.senderId), true)
+  assert.equal(s.stats().messages, 0)
+  s.upsertMessages([row])
+  assert.equal(s.stats().messages, 0, '删除标记必须拦住后续同步')
+  assert.equal(s.deleteMessage(row.id, row.groupId, row.senderId), false, '已删除的消息不能重复删除')
   s.close(); clean(d)
 })
 
@@ -522,6 +615,21 @@ test('rpc: members/delete 必须同时有 groupId 和 confirm', async () => {
   const yes = await rpc('members/delete', { senderId: 'u1', groupId: 'g', confirm: true })
   assert.equal(yes.ok, true)
   assert.equal(yes.value.deleted, 1)
+  store.close(); clean(d)
+})
+
+test('rpc: 单条记忆编辑和删除必须校验群、成员和确认', async () => {
+  const d = tmp()
+  const store = createStore(d)
+  store.upsertMessages([{ id: 'g:1', groupId: 'g', senderId: 'u1', text: 'a', sentAt: 1 }])
+  const runtime = { store, configStore: createConfigStore(d), dataDir: d, embedder: {}, imReader: createImReader('/nope'), syncOnce: async () => ({}) }
+  const rpc = createRpc(runtime)
+  assert.equal((await rpc('members/message-update', { messageId: 'g:1', senderId: 'u1', text: 'b' })).ok, false, '编辑缺 groupId 应拒绝')
+  assert.equal((await rpc('members/message-update', { messageId: 'g:1', groupId: 'g', senderId: 'u1', text: 'b' })).ok, true)
+  assert.equal(store.messagesOf('u1', 'g')[0].text, 'b')
+  assert.equal((await rpc('members/message-delete', { messageId: 'g:1', groupId: 'g', senderId: 'u1' })).ok, false, '删除缺确认应拒绝')
+  assert.equal((await rpc('members/message-delete', { messageId: 'g:1', groupId: 'g', senderId: 'u1', confirm: true })).ok, true)
+  assert.equal((await rpc('members/message-delete', { messageId: 'g:1', groupId: 'g', senderId: 'u1', confirm: true })).ok, false, '重复删除应拒绝')
   store.close(); clean(d)
 })
 

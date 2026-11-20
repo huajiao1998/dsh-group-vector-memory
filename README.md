@@ -80,7 +80,7 @@ group_memory_lookup({ person: "王阿牛", query: "服务器", limit: 5 })
 
 ## 按群隔离
 
-数据按 `group_id` + `sender_id` 双重隔离。设置页的记忆管理是两级的：先选群，再选人。删除只删「这个群里的这个人」，后端强制要求 `groupId` + `confirm: true`，少一个就拒绝——防止跨群误删。
+数据按 `group_id` + `sender_id` 双重隔离。设置页的记忆管理是两级的：先选群，再选人。发言列表可翻页查看旧记录；可以逐条编辑、删除，也可以清除某个群友在该群的全部记忆。操作只影响插件记忆，不改动群聊原始记录。单条操作都强制校验 `groupId` + `senderId` + `messageId`，删除还要求 `confirm: true`，防止跨群误改误删。编辑会让旧向量失效，删除和编辑都会记录本地覆盖标记，避免下一轮只读 IM 同步把手工操作覆盖掉。
 
 ## 安装
 
@@ -123,6 +123,7 @@ dsh plugin --profile web add dsh-group-vector-memory
 
 ```
 messages(id, group_id, sender_id, sender_name, text, sent_at, embedding BLOB)
+message_overrides(id, action, text, updated_at) -- 本地编辑/删除覆盖
 meta(key, value)      -- last_sent_at 等
 profiles(...)         -- 预留
 ```
@@ -132,7 +133,7 @@ profiles(...)         -- 预留
 ## 开发
 
 ```bash
-node --test test/all.test.mjs     # 50 个单测
+node --test test/all.test.mjs     # 当前测试集
 node test/real-data.mjs           # 拿真实 IM 历史跑一遍召回
 ```
 
