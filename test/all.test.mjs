@@ -9,6 +9,7 @@ import { createImReader } from '../lib/dshim.js'
 import { recallSync, recallAsync, formatMemoryBlock, extractKeywords } from '../lib/recall.js'
 import { parseImSource, mountAgent, cleanQuery, findGroupMessage } from '../lib/inject.js'
 import { createRpc } from '../lib/rpc.js'
+import { registerMemoryTool } from '../lib/tool.js'
 import { createEmbedder } from '../lib/embed.js'
 
 const tmp = () => mkdtempSync(join(tmpdir(), 'gvm-'))
@@ -543,3 +544,103 @@ test('extractKeywords: 中文按 3-4 字切片', () => {
   assert.ok(kws.some(k => k.includes('群名')), '应包含「群名」相关片段')
   assert.ok(kws.every(k => k.length >= 2), '不应有单字')
 })
+
+// ---------------- 查询工具 group_memory_lookup ----------------
+function makeToolCtx() {
+  const captured = {}
+  const ctx = { tools: { register: (def) => { captured.def = def; return () => {} } } }
+  return { ctx, captured }
+}
+
+function makeToolRuntime(overrides = {}) {
+  const store = {
+    members: () => [
+      { senderId: 'uA', senderName: '王阿牛', count: 3 },
+      { senderId: 'uB', senderName: '织衣', count: 2 },
+    ],
+    groups: () => [{ groupId: 'g1', label: 'QQ群 · g1' }],
+    messagesOf: () => [
+      { id: 'm1', text: '最近的一条', sentAt: 1795000000000, groupId: 'g1' },
+    ],
+    searchByKeywords: () => [
+      { id: 'm2', text: '关键词命中的一条', sentAt: 1794900000000, groupId: 'g1' },
+    ],
+    vectorsBySender: () => [],
+    ...overrides.store,
+  }
+  return {
+    store,
+    configStore: { get: () => ({ enabled: true, recall: { minScore: 0.25 } }) },
+    embedder: { embedOne: async () => ({ vector: new Float32Array([1, 0]) }) },
+    log: () => {},
+    ...overrides,
+  }
+}
+
+test('tool: 注册了 group_memory_lookup', () => {
+  const { ctx, captured } = makeToolCtx()
+  registerMemoryTool(ctx, makeToolRuntime())
+  assert.equal(captured.def.name, 'group_memory_lookup')
+  assert.ok(captured.def.parameters.properties.person, '必须有 person 参数')
+  assert.deepEqual(captured.def.parameters.required, ['person'])
+})
+
+test('tool: 按名字查到人，返回最近记录', async () => {
+  const { ctx, captured } = makeToolCtx()
+  registerMemoryTool(ctx, makeToolRuntime())
+  const out = await captured.def.execute({ person: '王阿牛' })
+  assert.equal(out.found, 1)
+  assert.match(out.text, /王阿牛/)
+  assert.match(out.text, /最近的一条/)
+})
+
+test('tool: 名字只写一部分也能找到', async () => {
+  const { ctx, captured } = makeToolCtx()
+  registerMemoryTool(ctx, makeToolRuntime())
+  const out = await captured.def.execute({ person: '阿牛' })
+  assert.equal(out.found, 1)
+})
+
+test('tool: 查不到人时列出现有成员', async () => {
+  const { ctx, captured } = makeToolCtx()
+  registerMemoryTool(ctx, makeToolRuntime())
+  const out = await captured.def.execute({ person: '不存在的人' })
+  assert.equal(out.found, 0)
+  assert.match(out.text, /王阿牛/)
+})
+
+test('tool: 给 query 时走关键词召回', async () => {
+  const { ctx, captured } = makeToolCtx()
+  registerMemoryTool(ctx, makeToolRuntime())
+  const out = await captured.def.execute({ person: '王阿牛', query: '关键词' })
+  assert.equal(out.found, 1)
+  assert.match(out.text, /关键词命中的一条/)
+})
+
+test('tool: 插件关着时直说关了', async () => {
+  const { ctx, captured } = makeToolCtx()
+  const rt = makeToolRuntime()
+  rt.configStore.get = () => ({ enabled: false })
+  registerMemoryTool(ctx, rt)
+  const out = await captured.def.execute({ person: '王阿牛' })
+  assert.equal(out.found, 0)
+  assert.match(out.text, /关着/)
+})
+
+test('tool: limit 上限 30 且默认 8', async () => {
+  const { ctx, captured } = makeToolCtx()
+  const calls = []
+  const rt = makeToolRuntime({
+    store: {
+      members: () => [{ senderId: 'uA', senderName: '王阿牛', count: 3 }],
+      groups: () => [],
+      messagesOf: (sid, gid, lim) => { calls.push(lim); return [] },
+      searchByKeywords: () => [],
+      vectorsBySender: () => [],
+    },
+  })
+  registerMemoryTool(ctx, rt)
+  await captured.def.execute({ person: '王阿牛' })
+  assert.equal(calls[0], 8, '默认 8 条')
+})
+
