@@ -559,6 +559,7 @@ function makeToolRuntime(overrides = {}) {
       { senderId: 'uB', senderName: '织衣', count: 2 },
     ],
     groups: () => [{ groupId: 'g1', label: 'QQ群 · g1' }],
+    groupInfo: () => [{ groupId: 'g1', channel: 'qq', platformGroupId: 'OPENID1', qqNumber: '1050089697', name: 'AI生命' }],
     messagesOf: () => [
       { id: 'm1', text: '最近的一条', sentAt: 1795000000000, groupId: 'g1' },
     ],
@@ -634,6 +635,7 @@ test('tool: limit 上限 30 且默认 8', async () => {
     store: {
       members: () => [{ senderId: 'uA', senderName: '王阿牛', count: 3 }],
       groups: () => [],
+      groupInfo: () => [],
       messagesOf: (sid, gid, lim) => { calls.push(lim); return [] },
       searchByKeywords: () => [],
       vectorsBySender: () => [],
