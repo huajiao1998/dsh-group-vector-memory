@@ -22,6 +22,17 @@ const groupMessage = (meta = {}, rpc = 'qq-00000000-0000-4000-8000-000000000001'
   content: [{ type: 'text', text: `${wrapper ? '' : 'body before metadata\n'}<dsh_im_source>${JSON.stringify({ channel: 'qq', senderId: 'person-1', senderName: 'Name A', chatId: 'chat-a', ...meta })}</dsh_im_source>\n\nkeyword` }],
 })
 
+function splitGroupMessage(meta = {}, rpc) {
+  const original = groupMessage({ conversationType: 'group', ...meta }, rpc)
+  const [source] = original.content[0].text.split('\n\n')
+  const notice = text => ({ role: 'user', source: { kind: 'plugin:dsh-im', form: 'notice' }, content: [{ type: 'text', text }] })
+  return [
+    notice('<dsh_im_reply_to>{}</dsh_im_reply_to>'),
+    { ...original, content: [{ type: 'text', text: 'keyword' }] },
+    notice(source),
+  ]
+}
+
 function fixture(t, { mounted = true } = {}) {
   const cfg = { enabled: true, workspaces: ['/in'], inject: { enabled: true }, recall: { recent: 1, semantic: 8, minScore: 0.5 } }
   const dir = mkdtempDisposableSync(join(tmpdir(), 'gvm-scope-'))
@@ -234,4 +245,57 @@ test('preview retains literal results and non-agent admin opt-in retains broad q
   assert.equal((await admin.execute({ person: 'person-1' }, { agent: f.agent })).found, 0)
   assert.match((await admin.execute({ person: 'person-1' })).text, /keyword outside/)
   assert.equal((await memoryToolDefinition(f.runtime).execute({ person: 'person-1' })).found, 0)
+})
+
+test('dsh-im split notices preserve recall and bind the snapshot to the real request', async t => {
+  const f = fixture(t)
+  const messages = splitGroupMessage()
+  const snapshot = memory(await f.step(messages))
+  assert.equal(snapshot?.source.rpcId, messages[1].source.rpcId)
+  assert.match(snapshot.content[0].text, /recent allowed/)
+  assert.match(snapshot.content[0].text, /keyword allowed/)
+  assert.doesNotMatch(snapshot.content[0].text, /outside|other platform/)
+  assert.equal((await f.call({ person: 'person-1', query: 'keyword' })).found, 1)
+  f.setHostLabel('Fixture B')
+  assert.equal(memory(await f.step(messages)), null)
+  assert.equal((await f.call({ person: 'person-1' })).found, 0)
+})
+
+test('unpaired, conflicting, private or untrusted source notices are not accepted', async t => {
+  const f = fixture(t)
+  const [, msg, notice] = splitGroupMessage()
+  for (const messages of [
+    [msg], [notice, msg], [msg, notice, notice], [groupMessage(), notice],
+    [msg, { ...notice, source: { kind: 'plugin:other', form: 'notice' } }],
+    splitGroupMessage({ channel: 'feishu' }),
+    splitGroupMessage({ conversationType: 'direct' }),
+    splitGroupMessage({}, 'web-00000000-0000-4000-8000-000000000001'),
+    [msg, notice, ...splitGroupMessage({ chatId: 'chat-b' })],
+  ]) assert.equal(memory(await f.step(messages)), null)
+  assert.equal(f.hostRequests(), 0)
+})
+
+test('agent creation mounts immediately using the declared host workspace service', async t => {
+  const f = fixture(t, { mounted: false })
+  Object.defineProperty(f.agent.ctx, 'workingDirectory', { get() { throw new Error('cannot get property "workingDirectory" without inject') } })
+  let cwd = '/in'
+  f.runtime.workingDirectory = { get(session) { assert.equal(session, f.agent.session); return cwd } }
+  const lifecycle = new Map()
+  const dispose = installInjector({
+    agents: { list: () => [] },
+    on(name, fn, options) { assert.equal(options.global, true); lifecycle.set(name, fn); return () => lifecycle.delete(name) },
+  }, f.runtime)
+  t.after(dispose)
+  assert.equal(f.tool(), undefined)
+  lifecycle.get('agent/created')({ agent: f.agent })
+  assert.ok(f.tool())
+  const wrapped = groupMessage({ conversationType: 'group' })
+  const split = splitGroupMessage()
+  assert.ok(memory(await f.step([wrapped], 1, async () => ({ kind: 'enter', messages: split }))))
+  cwd = '/outside'
+  assert.equal(memory(await f.step(split, 2)), null)
+  cwd = '/in'
+  assert.ok(memory(await f.step(split, 3)))
+  lifecycle.get('agent/disposed')({ agent: f.agent })
+  assert.equal(f.tool(), undefined)
 })
