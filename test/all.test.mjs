@@ -700,3 +700,19 @@ test('workspace: 匹配的会话挂 pre-step 并注册工具（agent scope）', 
   assert.equal(tools[0].name, 'group_memory_lookup')
 })
 
+test('tool: render 必须返回内容块数组（dsh 会调 content.some）', () => {
+  const { ctx, captured } = makeToolCtx()
+  registerMemoryTool(ctx, makeToolRuntime())
+  const out = captured.def.output.render({}, { found: 1, text: 'hi' })
+  assert.ok(Array.isArray(out), 'render 必须返回数组，裸字符串会让 dsh 的 content.some 报错')
+  assert.equal(out[0].type, 'text')
+  assert.equal(out[0].text, 'hi')
+})
+
+test('tool: render 空值也返回数组', () => {
+  const { ctx, captured } = makeToolCtx()
+  registerMemoryTool(ctx, makeToolRuntime())
+  const out = captured.def.output.render({}, undefined)
+  assert.ok(Array.isArray(out))
+  assert.equal(out[0].type, 'text')
+})
