@@ -91,6 +91,7 @@ function fixture(t, { mounted = true } = {}) {
     hostRequests: () => hostRequests,
     embeddingCalls: () => embeddingCalls,
     tool: () => def.get('group_memory_lookup'),
+    archiveTool: () => def.get('group_chat_history'),
     call(args, definition = def.get('group_memory_lookup')) { return definition.execute(args, exec()) },
     step(messages, turn = 1, next = async () => ({ kind: 'enter', messages })) {
       return callbacks.get('agent/pre-step')({ messages, turn, step: 1, signal: exec().signal }, next)
@@ -131,6 +132,25 @@ test('pre-step and tool use the same authorized group; another channel may share
   assert.equal((await f.call({ person: 'person-1', groupId: 'archive-b' })).found, 0)
   assert.equal((await f.call({ person: 'person-1', groupId: 'archive-a' })).found, 0)
   assert.equal(f.hostRequests(), 4)
+})
+
+test('archive tool can read own messages only inside the currently authorized group', async t => {
+  const f = fixture(t)
+  f.cfg.inject.enabled = false
+  f.store.archive.copy([
+    { groupId: 'archive-a', sourceId: 'a-out', sourceSeq: { receivedAt: 11, rowid: 1 }, senderId: 'bot', senderName: '小鱼', text: '群内原话', sentAt: 11, direction: 'outbound', hasAttachments: false },
+    { groupId: 'archive-b', sourceId: 'b-out', sourceSeq: { receivedAt: 12, rowid: 2 }, senderId: 'bot', senderName: '小鱼', text: '别群原话', sentAt: 12, direction: 'outbound', hasAttachments: false },
+  ])
+  const tool = f.archiveTool()
+  const call = args => f.call(args, tool)
+  assert.ok((await call({ speaker: 'self' })).error)
+  assert.equal(memory(await f.step([groupMessage()])), null)
+  assert.deepEqual((await call({ speaker: 'self' })).items.map(row => row.text), ['群内原话'])
+  assert.ok((await call({ groupId: 'archive-b' })).error)
+  assert.deepEqual((await call({ keyword: '别群' })).items, [])
+  assert.equal(f.embeddingCalls(), 0)
+  f.setHostLabel('')
+  assert.ok((await call({ speaker: 'self' })).error)
 })
 
 test('QQ bare mention follow-up runs one authorized query with nearby matching context', async t => {
