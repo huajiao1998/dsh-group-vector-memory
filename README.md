@@ -27,15 +27,15 @@ git clone https://github.com/huajiao1998/dsh-group-vector-memory.git
 
 ## 查询群聊原文
 
-在「设置 → 群聊记忆 → 原文查询」中选群，按发言人、关键词和时间筛选。AI 可以用 `group_chat_history` 查询宿主授权的当前群，同样支持这些筛选。
+在「设置 → 群聊记忆 → 原文查询」中选群，按发言人、关键词和日期筛选。AI 可以用 `group_chat_history` 查询宿主授权的当前群，同样支持这些筛选。
 
 ```js
-group_chat_history({ keyword: '换模型', speaker: 'self', limit: 10 })
+group_chat_history({ keyword: '换模型', speaker: 'self', from: '2026-11-01', to: '2026-11-21', limit: 10 })
 ```
 
-`speaker: 'self'` 查机器人发出的消息，`speaker: 'others'` 查收到的消息，省略则查全部。结果按时间从新到旧，带 `nextCursor` 时可沿用筛选条件继续翻页。
+日期按 DSH 的本地时区，开始和结束日期均包含当天。`speaker: 'self'` 查机器人发出的消息，`speaker: 'others'` 查收到的消息，省略则查全部。结果按时间从新到旧，带 `nextCursor` 时可沿用筛选条件继续翻页。
 
-插件定期从 dsh-im 增量复制实际收到的群聊原文。初次同步的范围取决于源归档当时保留的记录。QQ 机器人发出的文本需要 dsh-im 接入端支持出站归档，从接入生效后记录。原文副本用于本地查询，与编辑、删除或预览成员召回记忆的操作分开。
+QQ 群里 @ 机器人并收到已归档的 AI 回复后，插件会从 dsh-im 增量同步。有待处理的记忆消息时，在同步入库后生成向量。手动同步可到「群聊记录」点「立即同步」。自动触发依赖支持回复完成事件的 dsh-im 接入端。首次同步的范围取决于源归档当时保留的记录。
 
 ## 会话召回
 

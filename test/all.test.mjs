@@ -115,16 +115,24 @@ function makeSyncRuntime(t, rows = []) {
   for (const row of rows) insert.run(...row)
   db.close()
   let dispose
-  const runtime = apply({ connection: { rpc: { handle() {} } }, effect: init => { dispose = init() } }, { dataDir: d, imPath })
+  const listeners = new Map()
+  const runtime = apply({
+    connection: { rpc: { handle() {} } },
+    effect: init => { dispose = init() },
+    on: (event, listener) => {
+      listeners.set(event, listener)
+      return () => listeners.delete(event)
+    },
+  }, { dataDir: d, imPath })
+  runtime.emitTestEvent = event => listeners.get(event)?.()
   t.after(() => { dispose(); clean(d) })
   return runtime
 }
 
-test('sync: watcher 不跳过待入库消息，同一时间戳可跨批次续读', async t => {
+test('sync: 同一时间戳可以跨批次续读', async t => {
   const rows = Array.from({ length: 502 }, (_, i) => [`m${String(i).padStart(3, '0')}`, '', '原始文本', 10])
   const runtime = makeSyncRuntime(t, rows)
   runtime.embedder.embedOne = async () => ({ vector: new Float32Array([1]), dims: 1 })
-  await runtime.watchNew()
   assert.equal(runtime.store.stats().messages, 0)
   assert.equal(runtime.store.getSyncCursor(), 0)
   assert.equal((await runtime.syncOnce()).added, 500)
@@ -138,11 +146,42 @@ test('sync: watcher 不跳过待入库消息，同一时间戳可跨批次续读
   assert.equal(runtime.store.stats().messages, 501)
 })
 
+test('sync: 回复事件追平待同步数据，并处理同步期间到达的新回复', async t => {
+  const rows = Array.from({ length: 502 }, (_, i) => [`row${i}`, `${i}`, `正文${i}`, 10])
+  const runtime = makeSyncRuntime(t, rows)
+  const first = Promise.withResolvers()
+  const requested = Promise.withResolvers()
+  let requests = 0
+  runtime.embedder.embedOne = async () => {
+    if (++requests === 1) { requested.resolve(); await first.promise }
+    return { vector: Float32Array.of(1) }
+  }
+  const notice = () => runtime.emitTestEvent('dsh-im/qq-group-replied')
+  assert.equal(runtime.store.archive.query('g').items.length, 0)
+  assert.equal(runtime.store.stats().messages, 0)
+  const run = notice()
+  await requested.promise
+  assert.equal(runtime.store.stats().messages, 502)
+  using db = new DatabaseSync(runtime.imReader.path)
+  db.prepare("INSERT INTO messages VALUES ('later', 'g', 'later', 'u1', '', '新回复之后', 11)").run()
+  assert.equal(notice(), run)
+  first.resolve()
+  await run
+  assert.equal(runtime.store.stats().embedded, 503)
+  assert.equal(requests, 503)
+  assert.equal(runtime.store.archive.query('g').items[0].text, '新回复之后')
+})
+
 test('sync: 编辑后的记忆不接收旧向量，无新消息照常重算', async t => {
   const runtime = makeSyncRuntime(t, [['row1', '1', '原始文本', 10]])
   const oldVector = Promise.withResolvers()
-  runtime.embedder.embedOne = () => oldVector.promise
+  const requested = Promise.withResolvers()
+  runtime.embedder.embedOne = text => {
+    requested.resolve(text)
+    return oldVector.promise
+  }
   const inFlight = runtime.syncOnce()
+  assert.equal(await requested.promise, '原始文本')
   const rpc = createRpc(runtime)
   const edited = await rpc('members/message-update', { messageId: 'g:1', groupId: 'g', senderId: 'u1', text: '修改后的文本' })
   assert.equal(edited.ok, true)

@@ -10,7 +10,7 @@ import { recallSync } from '../lib/recall.js'
 const row = (id, text, extra = {}) => ({ id, groupId: 'g', senderId: 's', text, sentAt: 1, ...extra })
 const vector = Float32Array.of(1, 0)
 
-test('ingest and prewarm share the message filter without altering accepted text', () => {
+test('ingest filters messages without altering accepted text', () => {
   using dir = mkdtempDisposableSync(join(tmpdir(), 'gvm-body-'))
   const store = createStore(dir.path)
   try {
@@ -21,7 +21,6 @@ test('ingest and prewarm share the message filter without altering accepted text
       row('other', '<@ABC>', { groupId: 'non-qq', channel: 'feishu' }),
       row('unknown', '<@ABC>', { groupId: 'unknown' }), row('media', '<@ABC>', { hasAttachments: true })]
     const input = [...accepted, ...rejected].map((message, i) => ({ ...message, sourceSeq: { receivedAt: 100, rowid: i + 1 } }))
-    assert.deepEqual(input.map(message => store.textForPrewarm(message)), [...accepted.map(r => r.text), '', '', ''])
     const through = input.at(-1).sourceSeq
     assert.equal(store.upsertMessages(input, through), accepted.length)
     assert.deepEqual(store.getSyncCursor(), through)

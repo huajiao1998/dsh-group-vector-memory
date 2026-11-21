@@ -38,12 +38,21 @@ test('原文逐页增量复制，出站、纯 @ 和空白不会进入向量记�
     rows = reader.sinceArrival(0, 10)
     assert.equal(store.archive.copy(rows), 0)
     store.upsertMessages(rows, rows.at(-1).sourceSeq)
-    assert.equal(store.textForPrewarm(rows[1]), '')
     assert.deepEqual(store.pendingEmbeddings().map(row => row.id).sort(), ['g1:message-a', 'g2:message-other'])
     assert.deepEqual(store.archive.query('g1', { speaker: 'self' }).items.map(row => row.text), ['换模型\n确认'])
     assert.deepEqual(store.archive.query('g1', { speaker: 'others', person: '群友', keyword: '123%', to: '2026-11-20T00:30:00Z' }).items.map(row => row.id), ['a'])
     assert.deepEqual(store.archive.query('g1', { keyword: '不存在' }).items, [])
-    assert.throws(() => store.archive.query('g1', { from: '2026-02-30T00:00:00Z' }), /时间无效/)
+    assert.throws(() => store.archive.query('g1', { from: '2026-02-30T00:00:00Z' }), /日期无效/)
+    const date = '2026-11-20'
+    const midnight = new Date(`${date}T00:00:00`).getTime()
+    const nextMidnight = new Date('2026-11-21T00:00:00').getTime()
+    store.archive.copy([['before', midnight - 1], ['start', midnight], ['end', nextMidnight - 1], ['after', nextMidnight]].map(([id, sentAt], i) => ({
+      groupId: 'days', sourceId: id, sourceSeq: { receivedAt: 1, rowid: i + 1 }, senderId: 'member', senderName: '群友',
+      direction: 'inbound', hasAttachments: false, text: id, sentAt,
+    })))
+    const dayRows = store.archive.query('days', { from: date, to: date }).items
+    assert.deepEqual(dayRows.map(item => [item.id, item.date]), [['end', date], ['start', date]])
+    assert.throws(() => store.archive.query('days', { from: '2026-11-21', to: date }), /开始日期/)
     const page = store.archive.query('g1', { limit: 2 })
     assert.deepEqual(page.items.map(row => row.id), ['empty', 'blank'])
     assert.equal(page.items[0].hasAttachments, true)
